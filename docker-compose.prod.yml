@@ -1,0 +1,269 @@
+services:
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1. PostgreSQL 16 (Enterprise Database with RLS)
+  # ────────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: edusaas_prod_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-edusaas_prod}
+      POSTGRES_USER: ${POSTGRES_USER:-edusaas_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-edusaas_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env.production}
+    # Security: Do not expose port 5432 to the public host in production!
+    expose:
+      - "5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./infrastructure/postgres/provision-app-role.sql:/opt/edusaas/provision-app-role.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2. Redis 7 (Cache, Celery Message Broker & Rate Limiting)
+  # ────────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: edusaas_prod_redis
+    restart: always
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "yes"
+    expose:
+      - "6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(redis-cli ping)\" = PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3. Backend API (FastAPI + Gunicorn Cluster)
+  # ────────────────────────────────────────────────────────────────────────────
+  backend:
+    image: edusaas-backend:production
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: edusaas_prod_backend
+    restart: always
+    env_file:
+      - ./backend/.env.production
+    expose:
+      - "8000"
+    volumes:
+      - app_uploads:/app/uploads
+      - app_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  migrate:
+    image: edusaas-backend:production
+    profiles: [operations]
+    environment:
+      MIGRATION_POSTGRES_HOST: postgres
+      MIGRATION_POSTGRES_DB: ${POSTGRES_DB:-edusaas_prod}
+      MIGRATION_POSTGRES_USER: ${POSTGRES_USER:-edusaas_admin}
+      MIGRATION_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+    command: ["alembic", "upgrade", "head"]
+    healthcheck:
+      disable: true
+    networks:
+      - internal_network
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4. Celery Asynchronous Task Worker
+  # ────────────────────────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: edusaas_prod_celery_worker
+    restart: always
+    env_file:
+      - ./backend/.env.production
+    volumes:
+      - app_uploads:/app/uploads
+      - app_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=INFO --concurrency=4 -E
+    healthcheck:
+      disable: true
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 5. Celery Beat Scheduler (Periodic Digests & Cron Reports)
+  # ────────────────────────────────────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: edusaas_prod_celery_beat
+    restart: always
+    env_file:
+      - ./backend/.env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app beat --loglevel=INFO
+    healthcheck:
+      disable: true
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 6. Web Frontend (React + Vite SPA)
+  # ────────────────────────────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.prod
+    container_name: edusaas_prod_web
+    restart: always
+    expose:
+      - "80"
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 7. Nginx Production Reverse Proxy & SSL Gateway
+  # ────────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: edusaas_prod_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/conf.d/prod.conf:/etc/nginx/conf.d/prod.conf:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_challenge:/var/www/certbot:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend
+      - web
+    networks:
+      - internal_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 8. Certbot (Automated Let's Encrypt SSL Certificate Renewal)
+  # ────────────────────────────────────────────────────────────────────────────
+  certbot:
+    image: certbot/certbot:latest
+    container_name: edusaas_prod_certbot
+    restart: unless-stopped
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_challenge:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;'"
+    networks:
+      - internal_network
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 9. Automated Database Daily Backup
+  # ────────────────────────────────────────────────────────────────────────────
+  backup:
+    image: postgres:16-alpine
+    container_name: edusaas_prod_backup
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-edusaas_prod}
+      POSTGRES_USER: ${POSTGRES_USER:-edusaas_admin}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres
+    volumes:
+      - backups_data:/backups
+    entrypoint: >
+      /bin/sh -c '
+      while true; do
+        DATE=$$(date +%Y%m%d_%H%M%S)
+        echo "Creating automated database backup at $$DATE..."
+        pg_dump -h $$POSTGRES_HOST -U $$POSTGRES_USER -d $$POSTGRES_DB --clean --if-exists --format=custom -f /backups/edusaas_backup_$$DATE.dump
+        echo "Backup completed: edusaas_backup_$$DATE.dump"
+        # Keep only the last 30 daily backup dumps
+        find /backups -name "edusaas_backup_*.dump" -type f -mtime +30 -delete
+        # Sleep for 24 hours
+        sleep 86400
+      done'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal_network
+
+networks:
+  internal_network:
+    driver: bridge
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+  app_uploads:
+  app_logs:
+  nginx_logs:
+  certbot_certs:
+  certbot_challenge:
+  backups_data:

@@ -1,0 +1,56 @@
+name: Production Continuous Deployment
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Deployment Environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  deploy:
+    name: Deploy to Production Ubuntu Server
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure SSH Key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+
+      - name: Deploy Cluster via SSH
+        env:
+          SERVER_HOST: ${{ secrets.PROD_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PROD_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH || '/opt/edusaas' }}
+        run: |
+          echo "Connecting to production server $SERVER_HOST as $SERVER_USER..."
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "
+            set -e
+            cd $DEPLOY_PATH
+            chmod +x scripts/*.sh
+            ./scripts/deploy.sh main
+          "
+
+      - name: Run Remote Health Checks
+        env:
+          SERVER_HOST: ${{ secrets.PROD_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PROD_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH || '/opt/edusaas' }}
+        run: |
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "
+            cd $DEPLOY_PATH
+            ./scripts/healthcheck.sh
+          "
